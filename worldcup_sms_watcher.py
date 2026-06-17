@@ -27,15 +27,13 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "state.json"
 DEFAULT_ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
 DEFAULT_ESPN_SUMMARY_URL_TEMPLATE = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event={event_id}"
-DEFAULT_EVENT_TYPES = "goal,red_card,yellow_card,substitution,penalty,var"
+DEFAULT_EVENT_TYPES = "goal"
 DEFAULT_SEND_DELAY_SECONDS = 12
 EVENT_TEST_ALERTS = [
     "GOAL Portugal: Cristiano Ronaldo | Portugal 1-0 Congo DR | 23'",
-    "YELLOW CARD Congo DR: Chancel Mbemba | Portugal 1-0 Congo DR | 31'",
-    "RED CARD Portugal: Pepe | Portugal 1-0 Congo DR | 54'",
-    "PENALTY Congo DR: Cedric Bakambu | Portugal 1-1 Congo DR | 66'",
-    "VAR | Goal review complete | Portugal 1-1 Congo DR | 68'",
-    "SUB Portugal | Bruno Fernandes replaced by Joao Felix | Portugal 1-1 Congo DR | 72'",
+    "GOAL Congo DR: Cedric Bakambu | Portugal 1-1 Congo DR | 66'",
+    "Cancelled | Portugal 1-1 Congo DR",
+    "Fulltime | Portugal 2-1 Congo DR",
 ]
 
 
@@ -395,11 +393,7 @@ def build_alerts(previous: dict[str, Any] | None, current: MatchSnapshot, notify
 
     prev_home_score = parse_score(previous.get("home_score"))
     prev_away_score = parse_score(previous.get("away_score"))
-    prev_status_state = str(previous.get("status_state") or "")
     prev_status_name = str(previous.get("status_name") or "")
-
-    if prev_status_state != "in" and current.status_state == "in":
-        alerts.append(Alert(f"{current.match_id}:kickoff", f"Kickoff | {scoreline}"))
 
     if current.home_score > prev_home_score:
         alerts.append(Alert(f"{current.match_id}:home_goal:{current.home_score}", f"GOAL {current.home} | {scoreline}{detail}"))
@@ -409,10 +403,10 @@ def build_alerts(previous: dict[str, Any] | None, current: MatchSnapshot, notify
 
     status_changed = prev_status_name != current.status_name
     status_text = current.status_name.upper()
-    if status_changed and "HALFTIME" in status_text:
-        alerts.append(Alert(f"{current.match_id}:halftime", f"Halftime | {scoreline}"))
+    if status_changed and ("CANCEL" in status_text or "POSTPONED" in status_text or "ABANDON" in status_text):
+        alerts.append(Alert(f"{current.match_id}:cancelled", f"Cancelled | {scoreline}{detail}"))
 
-    if status_changed and current.status_state == "post":
+    if status_changed and current.status_state == "post" and "CANCEL" not in status_text and "POSTPONED" not in status_text and "ABANDON" not in status_text:
         alerts.append(Alert(f"{current.match_id}:fulltime", f"Fulltime | {scoreline}"))
 
     return alerts
