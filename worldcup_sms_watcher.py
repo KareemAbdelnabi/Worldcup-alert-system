@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import smtplib
 import ssl
 import sys
@@ -64,6 +65,7 @@ class MatchEvent:
     team: str
     player: str
     description: str
+    assist: str = ""
 
 
 def load_dotenv(path: Path) -> None:
@@ -245,9 +247,68 @@ def extract_player_name(item: dict[str, Any]) -> str:
     return ""
 
 
+def extract_assist_name(item: dict[str, Any], scorer: str) -> str:
+    """Return the assisting player's name for a goal, or "" if there is none.
+
+    ESPN lists the scorer as the first participant and the assister (when one
+    exists) as the second. We fall back to parsing "Assisted by ..." out of the
+    event text if the structured list only carries the scorer.
+    """
+    names: list[str] = []
+    for key in ("participants", "athletes", "players"):
+        people = item.get(key)
+        if not isinstance(people, list):
+            continue
+        for person in people:
+            if not isinstance(person, dict):
+                continue
+            person_athlete = person.get("athlete") if isinstance(person.get("athlete"), dict) else person
+            name = nested_text(person_athlete, "displayName", "shortName", "fullName", "name")
+            if name and name not in names:
+                names.append(name)
+        if names:
+            break
+
+    scorer_norm = scorer.strip().lower()
+    for name in names:
+        if name.strip().lower() != scorer_norm:
+            return name
+
+    text = first_text(item.get("text"), item.get("description"))
+    match = re.search(r"[Aa]ssisted by ([^.]+?)(?:\s+(?:with|after|following)\b|\.|$)", text)
+    if match:
+        candidate = match.group(1).strip()
+        if candidate and candidate.lower() != scorer_norm:
+            return candidate
+
+    return ""
+
+
 def classify_event(type_text: str, description: str) -> str:
+    # Trust ESPN's structured type first -- it is a clean label ("Goal",
+    # "Yellow Card", ...) and, unlike the free-text description, is never
+    # polluted by player names (e.g. "Vargas" used to match "var" -> VAR).
+    type_norm = type_text.strip().lower()
+    if type_norm:
+        if "goal" in type_norm:
+            return "goal"
+        # Check red before yellow so a second-yellow sending-off
+        # ("Yellow Red Card") is reported as a red, not a booking.
+        if "red" in type_norm:
+            return "red_card"
+        if "yellow" in type_norm:
+            return "yellow_card"
+        if "substitut" in type_norm:
+            return "substitution"
+        if "penalty" in type_norm:
+            return "penalty"
+        if "var" in type_norm or "video assistant" in type_norm:
+            return "var"
+
+    # Fall back to description heuristics, using word boundaries so player
+    # names can't trigger a false match.
     haystack = f"{type_text} {description}".lower()
-    if "var" in haystack or "video assistant" in haystack or "review" in haystack:
+    if re.search(r"\bvar\b", haystack) or "video assistant" in haystack:
         return "var"
     if "red card" in haystack or "sent off" in haystack:
         return "red_card"
@@ -255,7 +316,7 @@ def classify_event(type_text: str, description: str) -> str:
         return "yellow_card"
     if "substitution" in haystack or "substitute" in haystack:
         return "substitution"
-    if "penalty" in haystack and any(word in haystack for word in ("miss", "saved", "score", "goal")):
+    if "penalty" in haystack and any(word in haystack for word in ("miss", "missed", "saved")):
         return "penalty"
     if "goal" in haystack or "scores" in haystack:
         return "goal"
@@ -265,7 +326,10 @@ def classify_event(type_text: str, description: str) -> str:
 def format_event_alert(event: MatchEvent, snapshot: MatchSnapshot) -> str:
     scoreline = f"{snapshot.home} {snapshot.home_score}-{snapshot.away_score} {snapshot.away}"
     minute = f" | {event.minute}" if event.minute else ""
-    player = f": {event.player}" if event.player else ""
+    if event.kind == "goal":
+        player = format_goal_credit(event.player, event.assist)
+    else:
+        player = f": {event.player}" if event.player else ""
     team = f" {event.team}" if event.team else ""
 
     labels = {
@@ -317,6 +381,7 @@ def parse_espn_match_events(match_id: str, data: dict[str, Any]) -> list[MatchEv
         minute = nested_text(clock, "displayValue") if isinstance(clock, dict) else first_text(item.get("time"), item.get("minute"))
         team = nested_text(item.get("team"), "shortDisplayName", "displayName", "name") if isinstance(item.get("team"), dict) else ""
         player = extract_player_name(item)
+        assist = extract_assist_name(item, player) if kind == "goal" else ""
         event_id = first_text(item.get("id"), item.get("sequenceNumber"), item.get("sequence"), f"{kind}:{minute}:{team}:{player}:{index}")
 
         events.append(
@@ -328,6 +393,7 @@ def parse_espn_match_events(match_id: str, data: dict[str, Any]) -> list[MatchEv
                 team=team,
                 player=player,
                 description=description,
+                assist=assist,
             )
         )
 
@@ -348,20 +414,27 @@ def get_espn_event_alerts(snapshot: MatchSnapshot, enabled_types: set[str]) -> l
     return alerts
 
 
-def get_latest_goal_scorer(match_id: str, team_name: str, expected_count: int = 0) -> str:
-    """Return the scorer for team_name's goal number ``expected_count``.
+# How long to wait for ESPN's detail feed to publish a goal's scorer/assist.
+# The feed trails the scoreboard, especially during stoppage-time bursts, so we
+# poll it repeatedly. The lookup returns as soon as the scorer is confirmed, so
+# this is an upper bound that only applies when the feed is slow.
+GOAL_CREDIT_ATTEMPTS = 12
+GOAL_CREDIT_SLEEP_SECONDS = 3
 
-    The ESPN summary feed often lags the scoreboard, so a goal that just
-    changed the score may not be listed in the match details yet. We retry a
-    few times to let the feed catch up, and only return a name once the
-    scoring team actually has that many goals on record. If we can't confirm
-    the scorer we return "" rather than guess -- a missing name is far better
-    than attributing the other team's previous scorer.
+
+def get_goal_credit(match_id: str, team_name: str, expected_count: int = 0) -> tuple[str, str]:
+    """Return ``(scorer, assist)`` for team_name's goal number ``expected_count``.
+
+    The ESPN feed often lags the scoreboard, so a goal that just changed the
+    score may not be listed in the match details yet. We retry to let the feed
+    catch up, and only return a name once the scoring team actually has that
+    many goals on record. If we can't confirm it we return empty strings rather
+    than guess -- missing names beat wrong ones.
     """
     template = os.environ.get("WC_SMS_ESPN_SUMMARY_URL_TEMPLATE") or DEFAULT_ESPN_SUMMARY_URL_TEMPLATE
     target = team_name.strip().lower()
 
-    for attempt in range(6):
+    for attempt in range(GOAL_CREDIT_ATTEMPTS):
         try:
             data = fetch_json(template.format(event_id=match_id))
         except (URLError, TimeoutError, json.JSONDecodeError, OSError):
@@ -374,16 +447,20 @@ def get_latest_goal_scorer(match_id: str, team_name: str, expected_count: int = 
             if target and g.team.strip() and (g.team.strip().lower() in target or target in g.team.strip().lower())
         ]
 
+        chosen: MatchEvent | None = None
         if expected_count > 0:
             if len(team_goals) >= expected_count:
-                return team_goals[expected_count - 1].player
+                chosen = team_goals[expected_count - 1]
         elif team_goals:
-            return team_goals[-1].player
+            chosen = team_goals[-1]
 
-        if attempt < 5:
-            time.sleep(3)
+        if chosen is not None:
+            return chosen.player, chosen.assist
 
-    return ""
+        if attempt < GOAL_CREDIT_ATTEMPTS - 1:
+            time.sleep(GOAL_CREDIT_SLEEP_SECONDS)
+
+    return "", ""
 
 
 def get_demo_snapshots() -> list[MatchSnapshot]:
@@ -419,6 +496,15 @@ def snapshot_to_state(snapshot: MatchSnapshot) -> dict[str, Any]:
     }
 
 
+def format_goal_credit(scorer: str, assist: str) -> str:
+    """Build the ": Scorer (assist: Assister)" fragment for a goal alert."""
+    if not scorer:
+        return ""
+    if assist:
+        return f": {scorer} (assist: {assist})"
+    return f": {scorer}"
+
+
 def build_alerts(
     previous: dict[str, Any] | None,
     current: MatchSnapshot,
@@ -442,13 +528,13 @@ def build_alerts(
     prev_status_name = str(previous.get("status_name") or "")
 
     if current.home_score > prev_home_score:
-        scorer = scorer_lookup(current, True) if scorer_lookup else ""
-        who = f": {scorer}" if scorer else ""
+        scorer, assist = scorer_lookup(current, True) if scorer_lookup else ("", "")
+        who = format_goal_credit(scorer, assist)
         alerts.append(Alert(f"{current.match_id}:home_goal:{current.home_score}", f"GOAL {current.home}{who} | {scoreline}{detail}"))
 
     if current.away_score > prev_away_score:
-        scorer = scorer_lookup(current, False) if scorer_lookup else ""
-        who = f": {scorer}" if scorer else ""
+        scorer, assist = scorer_lookup(current, False) if scorer_lookup else ("", "")
+        who = format_goal_credit(scorer, assist)
         alerts.append(Alert(f"{current.match_id}:away_goal:{current.away_score}", f"GOAL {current.away}{who} | {scoreline}{detail}"))
 
     status_changed = prev_status_name != current.status_name
@@ -481,12 +567,12 @@ def poll(provider: str, dry_run: bool, notify_existing: bool, event_alerts: bool
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    def scorer_lookup(snap: MatchSnapshot, is_home: bool) -> str:
+    def scorer_lookup(snap: MatchSnapshot, is_home: bool) -> tuple[str, str]:
         if provider != "espn":
-            return ""
+            return "", ""
         team = snap.home if is_home else snap.away
         expected = snap.home_score if is_home else snap.away_score
-        return get_latest_goal_scorer(snap.match_id, team, expected)
+        return get_goal_credit(snap.match_id, team, expected)
 
     alert_texts: list[str] = []
     for snapshot in snapshots:
