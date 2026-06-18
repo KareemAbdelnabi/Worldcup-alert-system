@@ -348,22 +348,42 @@ def get_espn_event_alerts(snapshot: MatchSnapshot, enabled_types: set[str]) -> l
     return alerts
 
 
-def get_latest_goal_scorer(match_id: str, team_name: str) -> str:
-    """Return the player name of the most recent goal for team_name, or "" if unknown."""
+def get_latest_goal_scorer(match_id: str, team_name: str, expected_count: int = 0) -> str:
+    """Return the scorer for team_name's goal number ``expected_count``.
+
+    The ESPN summary feed often lags the scoreboard, so a goal that just
+    changed the score may not be listed in the match details yet. We retry a
+    few times to let the feed catch up, and only return a name once the
+    scoring team actually has that many goals on record. If we can't confirm
+    the scorer we return "" rather than guess -- a missing name is far better
+    than attributing the other team's previous scorer.
+    """
     template = os.environ.get("WC_SMS_ESPN_SUMMARY_URL_TEMPLATE") or DEFAULT_ESPN_SUMMARY_URL_TEMPLATE
-    try:
-        data = fetch_json(template.format(event_id=match_id))
-    except (URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return ""
-
-    goals = [event for event in parse_espn_match_events(match_id, data) if event.kind == "goal"]
-    if not goals:
-        return ""
-
     target = team_name.strip().lower()
-    team_goals = [g for g in goals if target and (g.team.strip().lower() in target or target in g.team.strip().lower())]
-    chosen = (team_goals or goals)[-1]
-    return chosen.player
+
+    for attempt in range(6):
+        try:
+            data = fetch_json(template.format(event_id=match_id))
+        except (URLError, TimeoutError, json.JSONDecodeError, OSError):
+            data = {}
+
+        goals = [event for event in parse_espn_match_events(match_id, data) if event.kind == "goal"]
+        team_goals = [
+            g
+            for g in goals
+            if target and g.team.strip() and (g.team.strip().lower() in target or target in g.team.strip().lower())
+        ]
+
+        if expected_count > 0:
+            if len(team_goals) >= expected_count:
+                return team_goals[expected_count - 1].player
+        elif team_goals:
+            return team_goals[-1].player
+
+        if attempt < 5:
+            time.sleep(3)
+
+    return ""
 
 
 def get_demo_snapshots() -> list[MatchSnapshot]:
@@ -464,7 +484,9 @@ def poll(provider: str, dry_run: bool, notify_existing: bool, event_alerts: bool
     def scorer_lookup(snap: MatchSnapshot, is_home: bool) -> str:
         if provider != "espn":
             return ""
-        return get_latest_goal_scorer(snap.match_id, snap.home if is_home else snap.away)
+        team = snap.home if is_home else snap.away
+        expected = snap.home_score if is_home else snap.away_score
+        return get_latest_goal_scorer(snap.match_id, team, expected)
 
     alert_texts: list[str] = []
     for snapshot in snapshots:
