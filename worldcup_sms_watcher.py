@@ -286,11 +286,14 @@ def format_event_alert(event: MatchEvent, snapshot: MatchSnapshot) -> str:
 
 def parse_espn_match_events(match_id: str, data: dict[str, Any]) -> list[MatchEvent]:
     competitions = data.get("competitions") or []
-    if not competitions:
-        return []
-
-    competition = competitions[0]
-    raw_events = competition.get("details") or data.get("details") or data.get("plays") or []
+    competition = competitions[0] if competitions else {}
+    raw_events = (
+        competition.get("details")
+        or data.get("details")
+        or data.get("plays")
+        or data.get("keyEvents")
+        or []
+    )
     events: list[MatchEvent] = []
 
     for index, item in enumerate(raw_events):
@@ -345,6 +348,24 @@ def get_espn_event_alerts(snapshot: MatchSnapshot, enabled_types: set[str]) -> l
     return alerts
 
 
+def get_latest_goal_scorer(match_id: str, team_name: str) -> str:
+    """Return the player name of the most recent goal for team_name, or "" if unknown."""
+    template = os.environ.get("WC_SMS_ESPN_SUMMARY_URL_TEMPLATE") or DEFAULT_ESPN_SUMMARY_URL_TEMPLATE
+    try:
+        data = fetch_json(template.format(event_id=match_id))
+    except (URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return ""
+
+    goals = [event for event in parse_espn_match_events(match_id, data) if event.kind == "goal"]
+    if not goals:
+        return ""
+
+    target = team_name.strip().lower()
+    team_goals = [g for g in goals if target and (g.team.strip().lower() in target or target in g.team.strip().lower())]
+    chosen = (team_goals or goals)[-1]
+    return chosen.player
+
+
 def get_demo_snapshots() -> list[MatchSnapshot]:
     state = load_state()
     already_demoed = state.get("demo_counter", 0)
@@ -378,7 +399,12 @@ def snapshot_to_state(snapshot: MatchSnapshot) -> dict[str, Any]:
     }
 
 
-def build_alerts(previous: dict[str, Any] | None, current: MatchSnapshot, notify_existing: bool) -> list[Alert]:
+def build_alerts(
+    previous: dict[str, Any] | None,
+    current: MatchSnapshot,
+    notify_existing: bool,
+    scorer_lookup: Any = None,
+) -> list[Alert]:
     scoreline = f"{current.home} {current.home_score}-{current.away_score} {current.away}"
     detail = f" | {current.status_detail}" if current.status_detail else ""
 
@@ -396,10 +422,14 @@ def build_alerts(previous: dict[str, Any] | None, current: MatchSnapshot, notify
     prev_status_name = str(previous.get("status_name") or "")
 
     if current.home_score > prev_home_score:
-        alerts.append(Alert(f"{current.match_id}:home_goal:{current.home_score}", f"GOAL {current.home} | {scoreline}{detail}"))
+        scorer = scorer_lookup(current, True) if scorer_lookup else ""
+        who = f": {scorer}" if scorer else ""
+        alerts.append(Alert(f"{current.match_id}:home_goal:{current.home_score}", f"GOAL {current.home}{who} | {scoreline}{detail}"))
 
     if current.away_score > prev_away_score:
-        alerts.append(Alert(f"{current.match_id}:away_goal:{current.away_score}", f"GOAL {current.away} | {scoreline}{detail}"))
+        scorer = scorer_lookup(current, False) if scorer_lookup else ""
+        who = f": {scorer}" if scorer else ""
+        alerts.append(Alert(f"{current.match_id}:away_goal:{current.away_score}", f"GOAL {current.away}{who} | {scoreline}{detail}"))
 
     status_changed = prev_status_name != current.status_name
     status_text = current.status_name.upper()
@@ -431,10 +461,15 @@ def poll(provider: str, dry_run: bool, notify_existing: bool, event_alerts: bool
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
+    def scorer_lookup(snap: MatchSnapshot, is_home: bool) -> str:
+        if provider != "espn":
+            return ""
+        return get_latest_goal_scorer(snap.match_id, snap.home if is_home else snap.away)
+
     alert_texts: list[str] = []
     for snapshot in snapshots:
         previous = matches_state.get(snapshot.match_id)
-        alerts = build_alerts(previous, snapshot, notify_existing)
+        alerts = build_alerts(previous, snapshot, notify_existing, scorer_lookup=scorer_lookup)
         if provider == "espn" and event_alerts and snapshot.status_state == "in":
             alerts.extend(get_espn_event_alerts(snapshot, event_types))
         matches_state[snapshot.match_id] = snapshot_to_state(snapshot)
